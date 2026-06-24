@@ -1,0 +1,257 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------------------------------------------
+// 1. SYSTEM CONFIGURATION & AUDITING
+// ------------------------------------------------------
+model PayrollRun {
+  id               String    @id @default(uuid())
+  monthYear        String    @unique // e.g., "June 2026"
+  workingDaysCount Int       @default(22) // Changes dynamically month-to-month
+  weekendBonus     Float     @default(6000) // The ₦6,000 flat weekend bonus
+  status           RunStatus @default(DRAFT)
+  createdAt        DateTime  @default(now())
+  lockedAt         DateTime?
+
+  // Relationships
+  salaries Salary[]
+}
+
+enum RunStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+}
+
+// ------------------------------------------------------
+// 2. STAFF MASTER DATA
+// ------------------------------------------------------
+model Staff {
+  staffId       String  @id // Custom ID like "V00001"
+  name          String
+  bankName      String
+  accountNumber String
+  accountName   String
+  bankSortCode  String
+  payGrade      String // References DepartmentPaygrade (can also be made relational later if needed)
+  isActive      Boolean @default(true)
+
+  // Relational Fields
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id])
+
+  locationId String
+  location   Location @relation(fields: [locationId], references: [id])
+
+  positionId String
+  position   DepartmentPosition @relation(fields: [positionId], references: [positionId])
+
+  // Relationships
+  salaries Salary[]
+}
+
+// ------------------------------------------------------
+// 3. DEPARTMENTS, LOCATIONS, POSITIONS & PAYGRADES
+// ------------------------------------------------------
+model Department {
+  id             String   @id @default(uuid())
+  name           String   @unique // e.g., "Engineering", "Operations"
+  costCenterCode String? // e.g., "CC-104" (Optional, for accounting)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  // Relationships
+  staff     Staff[]
+  positions DepartmentPosition[]
+  paygrades DepartmentPaygrade[]
+}
+
+model Location {
+  id                String   @id @default(uuid())
+  name              String   @unique // e.g., "Lagos HQ", "Warri Rig 1"
+  locationType      String // e.g., "ONSHORE" or "OFFSHORE"
+  hasLunchAllowance Boolean  @default(true) // Dynamic policy rule toggle
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  // Relationships
+  staff Staff[]
+}
+
+model DepartmentPosition {
+  positionId            String       @id @default(uuid())
+  title                 String // e.g., "Welder", "Receptionist", "Project Manager"
+  positionLevel         Int
+  positionType          PositionType @default(NONE) // Handles special rules for allowances
+  hasDetergentAllowance Boolean      @default(true)
+
+  // Relational Fields
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id])
+
+  // Relationships
+  staff Staff[]
+}
+
+enum PositionType {
+  MANAGER
+  WELDER
+  FITTER
+  NONE
+}
+
+model DepartmentPaygrade {
+  id                 String @id @default(uuid())
+  payGrade           String // e.g., "Grade 1", "Level 17"
+  basicSalary        Float
+  housingAllowance   Float // Raw absolute value (calculated at 40% of basic)
+  transportAllowance Float // Raw absolute value (calculated at 30% of basic)
+
+  // Relational Fields
+  departmentId String
+  department   Department @relation(fields: [departmentId], references: [id])
+
+  @@unique([departmentId, payGrade]) // Prevents duplicate paygrades inside the same department
+}
+
+// ------------------------------------------------------
+// 4. THE PAYROLL REGISTER (Employee Take-Home)
+// ------------------------------------------------------
+model Salary {
+  id           String @id @default(uuid())
+  payrollRunId String
+  staffId      String
+
+  // Ties this specific row to a month and an employee
+  payrollRun PayrollRun @relation(fields: [payrollRunId], references: [id])
+  staff      Staff      @relation(fields: [staffId], references: [staffId])
+
+  // Variables captured at the exact moment this payroll is generated
+  month    String // e.g., "June 2026"
+  position String
+  project  String
+  location String // Retained as a String snapshot to insulate historical runs from future location renames
+  level    Int
+  period   String
+
+  // Attendance Inputs
+  monthlyHrsWorked       Float
+  expectedMonthlyHrs     Float @default(168)
+  weekdaySaturdayOtHours Float @default(0)
+  sundayPublicHolOtHours Float @default(0)
+  weekendDays            Int   @default(0)
+  offshoreDays           Int   @default(0)
+
+  // Current Dynamic Rates (Saved historically so old records never change)
+  weekdayOtRate Float
+  weekendOtRate Float
+  offshoreRate  Float @default(6000)
+
+  // Calculated Earnings (Prorated Base Salaries)
+  actualBasic             Float
+  actualHousing           Float
+  actualTransport         Float
+  actualLunch             Float
+  actualUtility           Float
+  actualXray              Float @default(0)
+  actualHeat              Float @default(0)
+  actualMilk              Float @default(0)
+  actualDetergent         Float @default(0)
+  responsibilityAllowance Float @default(0)
+
+  // Aggregated Allowances & Overtime Earnings
+  offshoreAllowance     Float @default(0)
+  weekendAllowance      Float @default(0) // Includes the ₦6,000 bonus logic
+  weekdayOtPay          Float @default(0)
+  weekendPublicHolOtPay Float @default(0)
+
+  // Grand Totals (Gross to Net)
+  grossSalary    Float
+  paye           Float
+  surcharge      Float @default(0)
+  nhis           Float @default(0)
+  pension        Float // Employee 8% BHT deduction
+  totalDeduction Float
+  netPay         Float
+
+  // Link to the company cost ledger
+  employerLiability EmployerContribution?
+}
+
+// ------------------------------------------------------
+// 5. EMPLOYER LIABILITIES (Company Costs)
+// ------------------------------------------------------
+model EmployerContribution {
+  id       String @id @default(uuid())
+  salaryId String @unique // 1-to-1 link with the employee's payslip
+  salary   Salary @relation(fields: [salaryId], references: [id])
+
+  // The Statutory Costs
+  employerPension Float // 10% of BHT
+  nsitf           Float // 1% of Gross
+  itf             Float // 1% of Gross
+
+  // The Flat / Lump Sum Costs (LS)
+  hmoCost   Float @default(0) // Pre-employment medical/HMO
+  groupLife Float @default(0) // Group Life Insurance
+
+  // The Grand Total Cost to Company
+  totalCompanyCost Float
+}
+
+// ------------------------------------------------------
+// 6. GLOBAL COMPANY POLICIES (Editable via UI Dashboard)
+// ------------------------------------------------------
+model CompanySetting {
+  id String @id @default("GLOBAL") // Forces only one master row
+
+  // Daily Rates
+  lunchAllowanceDaily Float @default(3000)
+  welderMilkDaily     Float @default(1500)
+
+  // Monthly Flat Rates
+  utilityAllowanceMonthly   Float @default(10000)
+  detergentAllowanceMonthly Float @default(5000)
+  welderHeatMonthly         Float @default(15000)
+  welderXrayMonthly         Float @default(15000)
+
+  // Percentages (Stored as decimals, e.g., 0.30 = 30%)
+  managerResponsibilityPct Float @default(0.30)
+
+  // Employee Deduction Percentages
+  pensionEmployeePct Float @default(0.08) // 8%
+
+  // Employer Liability Percentages
+  pensionEmployerPct Float @default(0.10) // 10%
+  nsitfPct           Float @default(0.01) // 1%
+  itfPct             Float @default(0.01) // 1%
+
+  updatedAt DateTime @updatedAt
+}
+
+model User {
+  id           String   @id @default(uuid())
+  firstName    String
+  lastName     String
+  email        String   @unique
+  passwordHash String
+  role         AuthRole @default(HR_MANAGER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@map("users") // Ensures the table maps cleanly to lower-case 'users' in Postgres
+}
+
+enum AuthRole {
+  SUPER_HR
+  HR_MANAGER
+  AUDITOR
+}
